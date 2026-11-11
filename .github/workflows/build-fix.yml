@@ -5,6 +5,12 @@ on:
   push:
     branches: [master, main]
   workflow_dispatch:
+    inputs:
+      only:
+        description: "只构建指定任务，便于单独复跑"
+        type: choice
+        default: all
+        options: [all, analyze, android, windows]
 
 permissions:
   contents: read
@@ -15,6 +21,7 @@ env:
 jobs:
   # 先跑静态分析，几分钟内就能暴露语法/类型错误，比完整构建反馈快。
   analyze:
+    if: github.event_name == 'push' || inputs.only == '' || inputs.only == 'all' || inputs.only == 'analyze'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -34,6 +41,7 @@ jobs:
         run: flutter analyze --no-fatal-infos --no-fatal-warnings
 
   android:
+    if: github.event_name == 'push' || inputs.only == '' || inputs.only == 'all' || inputs.only == 'android'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -85,6 +93,7 @@ jobs:
           overwrite: true
 
   windows:
+    if: github.event_name == 'push' || inputs.only == '' || inputs.only == 'all' || inputs.only == 'windows'
     runs-on: windows-2022
     steps:
       - name: Checkout
@@ -110,14 +119,19 @@ jobs:
       - name: Package portable zip
         shell: pwsh
         run: |
+          # 不能只按目录名找 Release：CMake 的中间目录里也有叫 Release 的，
+          # 必须选真正含 exe 的那个（build/windows/x64/runner/Release）。
           $releaseDir = Get-ChildItem -Path build/windows -Recurse -Directory -Filter Release |
+            Where-Object { Get-ChildItem -Path $_.FullName -Filter *.exe -ErrorAction SilentlyContinue } |
             Select-Object -First 1
           if (-not $releaseDir) {
-            Write-Error "Release directory not found under build/windows"
+            Write-Error "Release directory containing the exe was not found under build/windows"
             exit 1
           }
           Write-Host "Packaging $($releaseDir.FullName)"
+          Get-ChildItem $releaseDir.FullName | Select-Object Name, Length
           Compress-Archive -Path "$($releaseDir.FullName)\*" -DestinationPath "ClipShare-windows-x64.zip" -Force
+          Write-Host "Zip size: $((Get-Item ClipShare-windows-x64.zip).Length / 1MB) MB"
 
       - name: Upload Windows build
         uses: actions/upload-artifact@v4
