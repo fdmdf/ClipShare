@@ -90,6 +90,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # super_native_extensions 的 git 依赖含超长路径，Windows 必须开启长路径支持
+      - name: Enable Git long paths
+        run: git config --system core.longpaths true
+
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
