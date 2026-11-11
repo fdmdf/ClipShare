@@ -1,0 +1,190 @@
+name: build-linux-packages
+
+# 仓库写入权限
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      artifact-name:
+        value: linux-package
+
+env:
+  FLUTTER_VERSION: 3.41.9
+
+jobs:
+  # ============================================================
+  # 基于 ubuntu:22.02 LTS（glibc 2.35，>= liblua.so 所需 2.34）构建 deb、rpm、AppImage。
+  # flutter_embed_lua 插件自带的预编译 liblua.so 需要 GLIBC_2.34，
+  # 低于 2.34 的发行版无法加载该库，故选用 2.34 以上的 LTS 基座。
+  # ============================================================
+  build-linux:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
+
+    steps:
+    - name: Verify build environment
+      run: |
+        cat /etc/os-release
+        ldd --version | head -1
+        uname -a
+
+    - name: Install Linux dependencies
+      run: |
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          git curl unzip xz-utils zip file \
+          clang cmake ninja-build pkg-config build-essential \
+          lld locate rpm patchelf \
+          libgtk-3-dev liblzma-dev \
+          libkeybinder-3.0-dev \
+          libayatana-appindicator3-dev libayatana-indicator3-dev libayatana-ido3-0.4-dev \
+          libdbusmenu-glib-dev libdbusmenu-gtk3-dev \
+          libxtst-dev libx11-dev libwayland-dev wayland-protocols \
+          fuse libfuse-dev libnotify-dev
+        ldconfig
+
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: false
+
+    # CI 内修复（只影响构建产物，不修改仓库源码）：
+    # clipshare_clipboard_listener 插件要求 wayland-protocols >= 1.34 提供
+    #    staging/ext-data-control/ext-data-control-v1.xml；Ubuntu 24.04 自带 1.34 不含该文件，
+    #    这里下载并覆盖安装 1.41 的协议文件。
+    - name: Apply CI build fixes
+      run: |
+        set -e
+        cd /tmp
+        curl -fsSL -o wayland-protocols-1.41.deb \
+          "http://archive.ubuntu.com/ubuntu/pool/main/w/wayland-protocols/wayland-protocols_1.41-1_all.deb"
+        rm -rf /tmp/wp141
+        mkdir -p /tmp/wp141
+        dpkg-deb -x wayland-protocols-1.41.deb /tmp/wp141
+        cp -a /tmp/wp141/usr/share/wayland-protocols/. /usr/share/wayland-protocols/
+        ls -la /usr/share/wayland-protocols/staging/ext-data-control/
+
+    - name: Setup Flutter
+      run: |
+        git clone --depth 1 --branch "$FLUTTER_VERSION" https://github.com/flutter/flutter.git /opt/flutter
+        git config --global --add safe.directory /opt/flutter
+        echo "/opt/flutter/bin" >> "$GITHUB_PATH"
+        /opt/flutter/bin/flutter --version
+        /opt/flutter/bin/flutter config --enable-linux-desktop
+
+    - name: Install dependencies for Fastforge
+      run: |
+        dart pub global activate fastforge
+        echo "$HOME/.pub-cache/bin" >> $GITHUB_PATH
+        "$HOME/.pub-cache/bin/fastforge" --version
+
+    - name: Flutter pub get
+      run: flutter pub get
+
+    - name: Build Linux release
+      run: flutter build linux --release
+
+    - name: Package deb/rpm with Fastforge
+      run: |
+        fastforge package --platform linux --targets deb,rpm
+        mkdir -p output
+        find dist -name "*.deb" -exec cp {} output/ \;
+        find dist -name "*.rpm" -exec cp {} output/ \;
+
+    - name: Package AppImage
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        version="$(awk '/^version:/ {print $2; exit}' pubspec.yaml)"
+        arch="$(uname -m)"
+        bundle_dir="build/linux/x64/release/bundle"
+
+        if [[ ! -x "${bundle_dir}/clipshare" ]]; then
+          echo "Linux release binary not found: ${bundle_dir}/clipshare" >&2
+          exit 1
+        fi
+
+        app_name="ClipShare"
+        appimage_name="clipshare-${version}-linux.AppImage"
+        appdir="AppDir"
+
+        rm -rf "${appdir}"
+        mkdir -p output "${appdir}"
+
+        # 拷贝 flutter bundle 到 AppDir
+        cp -a "${bundle_dir}/." "${appdir}/"
+
+        # 拷贝运行时库
+        runtime_libs=(
+          "libkeybinder-3.0.so.0"
+          "libayatana-appindicator3.so.1"
+          "libayatana-indicator3.so.7"
+          "libayatana-ido3-0.4.so.0"
+          "libdbusmenu-glib.so.4"
+          "libdbusmenu-gtk3.so.4"
+          "libXtst.so.6"
+        )
+
+        mkdir -p "${appdir}/lib"
+        for soname in "${runtime_libs[@]}"; do
+          if [[ -f "${appdir}/lib/${soname}" ]]; then
+            continue
+          fi
+          lib_path="$(ldconfig -p | awk -v name="${soname}" '$1 == name { print $NF; exit }')"
+          if [[ -n "${lib_path}" && -f "${lib_path}" ]]; then
+            cp -L "${lib_path}" "${appdir}/lib/${soname}"
+          else
+            echo "Warning: runtime library not found: ${soname}" >&2
+          fi
+        done
+
+        # 创建 AppRun 启动脚本
+        cat > "${appdir}/AppRun" << 'APPRUNEOF'
+        #!/bin/bash
+        HERE="$(dirname "$(readlink -f "$0")")"
+        export LD_LIBRARY_PATH="${HERE}/lib:${LD_LIBRARY_PATH}"
+        exec "${HERE}/clipshare" "$@"
+        APPRUNEOF
+        chmod +x "${appdir}/AppRun"
+
+        # 创建 .desktop 文件
+        cat > "${appdir}/${app_name}.desktop" << DESKTOPEOF
+        [Desktop Entry]
+        Name=${app_name}
+        Comment=Clipboard sharing tool
+        Exec=clipshare
+        Icon=clipshare
+        Type=Application
+        Categories=Utility;
+        Terminal=false
+        DESKTOPEOF
+
+        # 拷贝图标
+        if [[ -f assets/images/logo/logo.png ]]; then
+          cp assets/images/logo/logo.png "${appdir}/clipshare.png"
+        fi
+
+        # 下载并运行 appimagetool
+        curl -L -o appimagetool \
+          "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${arch}.AppImage"
+        chmod +x appimagetool
+
+        export APPIMAGE_EXTRACT_AND_RUN=1
+        ./appimagetool "${appdir}" "output/${appimage_name}"
+
+        echo "AppImage created: output/${appimage_name}"
+
+    - name: Show output packages
+      run: ls -la output/
+
+    - name: Upload unified artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-package
+        path: output/*
+        overwrite: true

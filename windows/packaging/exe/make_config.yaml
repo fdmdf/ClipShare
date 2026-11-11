@@ -1,0 +1,15 @@
+# AppId 的值唯一标识此应用。
+# 不要在其他应用的安装程序中使用相同的 AppId 值。
+# 以下为示例代码，实际根据你的项目进行替换
+app_id: B72665DE-3DB5-B0E9-0EF9-55CCB65D3D62
+publisher: coclyun
+publisher_url: https://github.com/aa2013/ClipShare
+display_name: ClipShare
+create_desktop_icon: true
+install_dir_name: "{userappdata}\\ClipShare"
+launch_at_startup: false
+script_template: inno_setup.iss
+setup_icon_file: assets\images\logo\logo.ico
+locales:
+  - en
+  - zh

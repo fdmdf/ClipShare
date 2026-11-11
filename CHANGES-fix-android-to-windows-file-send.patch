@@ -1,0 +1,890 @@
+--- a/lib/app/handlers/sync/file_sync_handler.dart
++++ b/lib/app/handlers/sync/file_sync_handler.dart
+@@ -24,6 +24,7 @@
+ import 'package:clipshare/app/services/transport/socket_service.dart';
+ import 'package:clipshare/app/services/syncing_file_progress_service.dart';
+ import 'package:clipshare/app/services/transport/storage_service.dart';
++import 'package:clipshare/app/utils/constants.dart';
+ import 'package:clipshare/app/utils/extensions/device_extension.dart';
+ import 'package:clipshare/app/utils/extensions/file_extension.dart';
+ import 'package:clipshare/app/utils/extensions/number_extension.dart';
+@@ -50,6 +51,14 @@
+   Socket? _forwardSkt;
+   late final int _fileId;
+   bool hasClient = false;
++  /// 文件字节流是否真正开始写入 socket（仅"连上了"不代表开始发送）。
++  bool _sendStarted = false;
++  /// 保证 _onDone 只触发一次：发送队列不能被重复推进，也不能因异常永久卡住。
++  bool _doneCalled = false;
++  /// 与接收端相连的那个 socket，异常/超时时用于强制断开以通知对端。
++  Socket? _client;
++  /// content:// 落地用的临时目录，发送结束后清理。
++  Directory? _stagingDir;
+   File? _file;
+   PendingFile pendingFile;
+   late final BuildContext context;
+@@ -116,137 +125,246 @@
+         packet.setAll(header.length, payload);
+         //写入数据
+         skt.add(packet);
++      }).catchError((Object err, StackTrace stack) {
++        logger.error(tag, "connect forward server failed. $err $stack");
++        sktService.removeSendFileRecordByForward(this, _fileId, targetDevId);
++        _closeTransferSockets(destroyClient: true);
++        _finishOnce();
+       });
+       //告知 SocketService
+       sktService.addSendFileRecordByForward(this, _fileId);
+       //延时检测是否有客户端连接，超时取消发送
+       _delayedClientCheck(() {
+-        _onDone();
++        _finishOnce();
+         sktService.removeSendFileRecordByForward(this, _fileId, targetDevId!);
+       });
+     } else {
+-      ServerSocket.bind(InternetAddress.anyIPv4, 0).then((server) {
+-        _server = server;
+-        onReady(this);
+-        _server!.listen((client) async {
++      // 绑定/监听失败也要推进队列，否则多文件发送会永久停在第一个文件。
++      unawaited(_startDirectServer(onReady));
++    }
++  }
++
++  /// 启动直连模式的临时文件服务，并把端口通过主连接告知接收端。
++  Future<void> _startDirectServer(void Function(FileSyncHandler) onReady) async {
++    try {
++      final server = await ServerSocket.bind(InternetAddress.anyIPv4, 0);
++      _server = server;
++      onReady(this);
++      server.listen(
++        (client) {
+           hasClient = true;
+-          try {
+-            //向客户端发送文件
+-            sendFile2Socket(client);
+-          } catch (err, stack) {
+-            logger.error(tag, "$err,$stack");
+-            hasClient = false;
+-            client.close();
+-            _server?.close();
+-          }
+-        });
+-        _delayedClientCheck(_onDone);
+-      });
++          // 必须接住 sendFile2Socket 的异步异常：Android 侧读取 content://
++          // 失败时，未处理的异常会让 socket 永不关闭，接收端 onDone 不触发。
++          unawaited(sendFile2Socket(client));
++        },
++        onError: (Object err, StackTrace stack) {
++          logger.error(tag, "file server error. $err $stack");
++          _closeTransferSockets(destroyClient: true);
++          _finishOnce();
++        },
++        cancelOnError: false,
++      );
++      _delayedClientCheck(_finishOnce);
++    } catch (err, stack) {
++      logger.error(tag, "bind file server failed. $err $stack");
++      _closeTransferSockets(destroyClient: true);
++      _finishOnce();
+     }
+   }
+ 
+   ///当文件接收方连接了中转服务器后由 SocketService 调用该方法通知发送端开始发送
+   void onForwardReceiverConnected() {
+     sktService.removeSendFileRecordByForward(this, _fileId, null);
++    final socket = _forwardSkt;
++    if (socket == null) {
++      logger.error(tag, "forward socket is null when receiver connected");
++      _closeTransferSockets(destroyClient: true);
++      _finishOnce();
++      return;
++    }
+     hasClient = true;
++    // 与直连模式一致：sendFile2Socket 自行兜底所有异常并推进队列。
++    unawaited(sendFile2Socket(socket));
++  }
++
++  /// 打开待发送文件的字节流。
++  ///
++  /// 桌面端直接读本地文件。Android 通过系统分享进来的文件是 content:// URI，
++  /// 依赖 uri_file_reader 的 EventChannel 流；当临时 URI 读权限失效、Activity
++  /// 已分离或 provider 拒绝时，该流会返回 null 或抛 PlatformException。此时
++  /// 退化为「先把 URI 落地成临时本地文件、再按普通文件读」，让 Android→桌面
++  /// 与桌面→桌面走同一条已验证过的发送路径，而不是静默失败。
++  Future<Stream<List<int>>> _openSendStream() async {
++    if (!isUri) {
++      return _file!.openRead();
++    }
+     try {
+-      //向 中转服务器 发送文件
+-      sendFile2Socket(_forwardSkt!);
++      final uriStream = await uriFileReader.readFileAsBytesStream(pendingFile.filePath);
++      if (uriStream != null) {
++        return uriStream.cast<List<int>>();
++      }
++      logger.warn(tag, "content uri stream is null, fallback to temp file");
+     } catch (err, stack) {
+-      logger.error(tag, "$err,$stack");
++      logger.warn(tag, "read content uri failed, fallback to temp file. $err $stack");
++    }
++
++    final stagingDir = Directory("${appConfig.cachePath}${Constants.dirSeparate}send_${DateTime.now().microsecondsSinceEpoch}");
++    await stagingDir.create(recursive: true);
++    _stagingDir = stagingDir;
++    final copiedPath = await uriFileReader.copyFileFromUri(pendingFile.filePath, stagingDir.path);
++    if (copiedPath == null || !File(copiedPath).existsSync()) {
++      throw StateError("unable to read content uri: ${pendingFile.filePath}");
++    }
++    // 接收端以文件 basename 作为保存名，这里保持分享时的 DISPLAY_NAME。
++    final displayName = (pendingFile.fileName ?? "file").replaceAll(RegExp(r'[/\\]'), "_");
++    final targetPath = "${stagingDir.path}${Constants.dirSeparate}$displayName";
++    var localPath = copiedPath;
++    if (displayName.isNotEmpty && targetPath != copiedPath) {
++      try {
++        File(copiedPath).renameSync(targetPath);
++        localPath = targetPath;
++      } catch (_) {
++        // 重命名失败时仍可用插件返回的路径，内容完整，仅文件名可能不同。
++      }
+     }
++    _file = File(localPath);
++    return _file!.openRead();
+   }
+ 
+-  ///向 socket 发送文件
++  ///向 socket 发送文件。
++  ///
++  /// 任何异常都必须收口在这里：关闭 socket（让接收端 onDone 一定触发）、释放
++  /// 临时服务、并且只推进一次发送队列，否则一个文件失败会让后续文件全部卡死。
+   Future<void> sendFile2Socket(Socket client) async {
+-    DateTime start = DateTime.now();
+-    final filePath = isUri ? pendingFile.filePath : _file!.normalizePath;
+-    final fileSize = isUri ? pendingFile.size! : _file!.lengthSync();
+-    final fileName = isUri ? pendingFile.fileName : _file!.fileName;
+-    final syncingFile = SyncingFile(
+-      totalSize: fileSize,
+-      context: context,
+-      filePath: filePath,
+-      fromDev: appConfig.device,
+-      isSender: true,
+-      startTime: DateTime.now().format(),
+-      onClose: (done) {
+-        if (done) {
+-          return;
+-        }
+-        client.destroy();
+-        syncingFileService.removeSyncingFile(filePath);
+-      },
+-    );
+-    syncingFileService.updateSyncingFile(syncingFile);
+-    Stream<List<int>> stream;
+-    if (isUri) {
+-      final nullableStream = await uriFileReader.readFileAsBytesStream(pendingFile.filePath);
+-      if (nullableStream == null) {
+-        Global.showSnackBarWarn(text: TranslationKey.failedToLoad.tr);
+-        throw TranslationKey.failedToLoad.tr;
+-      }
+-      stream = nullableStream.transform(
+-        StreamTransformer<Uint8List, List<int>>.fromHandlers(
+-          handleData: (data, sink) {
+-            syncingFile.addBytes(data);
+-            sink.add(data);
+-          },
+-        ),
++    _client = client;
++    final sourcePath = isUri ? pendingFile.filePath : _file!.normalizePath;
++    final fileName = isUri ? (pendingFile.fileName ?? "file") : _file!.fileName;
++    SyncingFile? syncingFile;
++    try {
++      final rawStream = await _openSendStream();
++      final actualSize = _file != null ? _file!.lengthSync() : (pendingFile.size ?? 0);
++      syncingFile = SyncingFile(
++        // content provider 声明的 SIZE 可能是 -1（未知），不能拿它做断言。
++        totalSize: actualSize < 0 ? 0 : actualSize,
++        context: context,
++        filePath: sourcePath,
++        fromDev: appConfig.device,
++        isSender: true,
++        startTime: DateTime.now().format(),
++        onClose: (done) {
++          if (done) return;
++          client.destroy();
++          syncingFileService.removeSyncingFile(sourcePath);
++        },
+       );
+-    } else {
+-      stream = _file!.openRead().transform(
++      syncingFileService.updateSyncingFile(syncingFile);
++      final stream = rawStream.transform(
+         StreamTransformer<List<int>, List<int>>.fromHandlers(
+           handleData: (data, sink) {
+-            syncingFile.addBytes(data);
++            syncingFile!.addBytes(data);
+             sink.add(data);
+           },
+         ),
+       );
++      syncingFile.setState(SyncingFileState.syncing);
++      // 到这里字节流才真正开始写入；超时兜底必须以它为判据。
++      _sendStarted = true;
++      await client.addStream(stream);
++
++      var path = sourcePath;
++      try {
++        path = Uri.decodeComponent(sourcePath);
++      } catch (_) {
++        // 路径本身不是合法的 percent-encoding 时保留原值。
++      }
++      final history = History(
++        id: _fileId,
++        uid: appConfig.userId,
++        devId: appConfig.devInfo.guid,
++        time: DateTime.now().toString(),
++        content: path,
++        type: HistoryContentType.file.value,
++        size: actualSize < 0 ? 0 : actualSize,
++        sync: true,
++      );
++      await Get.find<HistoryController>().addData(history, null, false);
++      syncingFile.setState(SyncingFileState.done);
++    } catch (err, stack) {
++      logger.error(tag, "send file failed: $sourcePath. $err $stack");
++      syncingFile?.setState(SyncingFileState.error);
++      Global.showSnackBarWarn(text: TranslationKey.failedToLoad.tr);
++      // 强制断开，让接收端立即收到 onDone/onError 并清理残缺文件，
++      // 而不是一直停在「接收中」并且留下 0 字节文件。
++      client.destroy();
++    } finally {
++      logger.info(tag, "send file($fileName) completed");
++      try {
++        // destroy 之后 close 可能失败或迟迟不返回，加超时避免连 finally 都卡住。
++        await client.close().timeout(const Duration(seconds: 5));
++      } catch (_) {
++        // ignored
++      }
++      _closeTransferSockets();
++      _cleanupStaging();
++      _finishOnce();
+     }
+-    syncingFile.setState(SyncingFileState.syncing);
+-    client
+-        .addStream(stream)
+-        .then((value) {
+-          var path = filePath;
+-          try {
+-            path = Uri.decodeComponent(filePath);
+-          } catch (err) {
+-            //ignored
+-          }
+-          var history = History(
+-            id: _fileId,
+-            uid: appConfig.userId,
+-            devId: appConfig.devInfo.guid,
+-            time: start.toString(),
+-            content: path,
+-            type: HistoryContentType.file.value,
+-            size: fileSize,
+-            sync: true,
+-          );
+-          final historyController = Get.find<HistoryController>();
+-          historyController.addData(history, null, false);
+-          syncingFile.setState(SyncingFileState.done);
+-        })
+-        .catchError((err, stack) {
+-          syncingFile.setState(SyncingFileState.error);
+-          logger.error(tag, "send file failed: $filePath. $err $stack");
+-        })
+-        .whenComplete(() {
+-          logger.info(tag, "send file($fileName) completed");
+-          client.close();
+-          _server?.close();
+-          _onDone();
+-        });
+   }
+ 
+-  ///在一定时间后检查是否有客户端连接，若无客户端则关闭服务
+-  void _delayedClientCheck(void Function() onDone) {
+-    Future.delayed(5.s, () {
+-      if (hasClient) return;
+-      logger.info(tag, "No client connection for more than 5 seconds");
++  void _finishOnce() {
++    if (_doneCalled) return;
++    _doneCalled = true;
++    try {
++      _onDone();
++    } catch (err, stack) {
++      logger.error(tag, "onDone callback failed. $err $stack");
++    }
++  }
++
++  /// 释放临时监听服务。[destroyClient] 仅在异常/超时场景为 true，
++  /// 正常发送完成后不能 destroy，否则会截掉 close() 尚未 flush 的尾包。
++  void _closeTransferSockets({bool destroyClient = false}) {
++    try {
+       _server?.close();
++    } catch (_) {}
++    try {
+       _forwardSkt?.close();
++    } catch (_) {}
++    if (destroyClient) {
++      try {
++        _client?.destroy();
++      } catch (_) {}
++    }
++  }
++
++  void _cleanupStaging() {
++    final dir = _stagingDir;
++    _stagingDir = null;
++    if (dir == null) return;
++    try {
++      if (dir.existsSync()) dir.deleteSync(recursive: true);
++    } catch (_) {}
++  }
++
++  ///在一定时间后检查是否真正开始传输，没有则关闭服务并推进队列。
++  ///
++  /// 旧实现只判断 hasClient，而 Android 的 content:// 分支在 await 插件流时
++  /// 卡住也会先置 hasClient = true，导致这个兜底永远不会生效。
++  void _delayedClientCheck(void Function() onDone) {
++    Future.delayed(20.s, () {
++      if (_doneCalled || (hasClient && _sendStarted)) return;
++      if (hasClient && !_sendStarted) {
++        // 已连上但仍卡在 content:// 解析：再给一段时间，避免大文件或慢
++        // provider 被误杀；仍无进展才真正放弃。
++        Future.delayed(30.s, () {
++          if (_doneCalled || _sendStarted) return;
++          logger.info(tag, "file transfer still not started, give up");
++          _closeTransferSockets(destroyClient: true);
++          onDone();
++        });
++        return;
++      }
++      logger.info(tag, "no client connection within 20 seconds, give up");
++      _closeTransferSockets(destroyClient: true);
+       onDone();
+     });
+   }
+@@ -343,50 +461,71 @@
+     required void Function() onDone,
+     required BuildContext context,
+   }) async {
+-    int totalSize;
+-    String fileName;
+-    if (pendingFile.isUri) {
+-      totalSize = pendingFile.size!;
+-      fileName = pendingFile.fileName!;
+-    } else {
+-      final file = File(pendingFile.filePath);
+-      totalSize = await file.length();
+-      fileName = file.fileName;
+-    }
+-    //如果存在多级文件夹就拼接上文件夹
+-    if (pendingFile.directories.isNotEmpty) {
+-      fileName = "${pendingFile.directories.join("/")}/$fileName";
+-    }
+-    if (device.isUseStorage) {
+-      final storageService = Get.find<StorageService>();
+-      final appConfig = Get.find<ConfigService>();
+-      // 存储中转也必须等待发送结束后再推进队列，否则多文件发送会卡在当前设备。
+-      await storageService.sendData(DevInfo.fromDevice(device), MsgType.file, {
+-        "fileId": appConfig.snowflake.nextId(),
+-        "filePath": pendingFile.filePath,
+-        "fileName": fileName,
+-        "isUri": pendingFile.isUri,
+-        "size": totalSize,
+-      });
++    // 这是 async void 入口，任何未捕获异常都会变成 Zone 级错误并且不再推进
++    // 队列；用幂等的 finish() 统一收口，保证每个文件一定只推进一次。
++    var finished = false;
++    void finish() {
++      if (finished) return;
++      finished = true;
+       onDone();
+-    } else {
+-      final sktService = Get.find<SocketService>();
+-      final useForward = sktService.isUseForward(device.guid);
+-      FileSyncHandler._private(
+-        pendingFile: pendingFile,
+-        context: context,
+-        useForward: useForward,
+-        targetDevId: useForward ? device.guid : null,
+-        onReady: (syncer) async {
+-          device.sendData(MsgType.file, {
++    }
++    try {
++      int totalSize;
++      String fileName;
++      if (pendingFile.isUri) {
++        totalSize = pendingFile.size ?? 0;
++        fileName = pendingFile.fileName ?? "file";
++      } else {
++        final file = File(pendingFile.filePath);
++        totalSize = await file.length();
++        fileName = file.fileName;
++      }
++      //如果存在多级文件夹就拼接上文件夹
++      if (pendingFile.directories.isNotEmpty) {
++        fileName = "${pendingFile.directories.join("/")}/$fileName";
++      }
++      if (device.isUseStorage) {
++        final storageService = Get.find<StorageService>();
++        final appConfig = Get.find<ConfigService>();
++        // 存储中转也必须等待发送结束后再推进队列，否则多文件发送会卡在当前设备。
++        // content:// 读取失败会一路抛到这里，必须收口，不能让队列断在异常上。
++        try {
++          await storageService.sendData(DevInfo.fromDevice(device), MsgType.file, {
++            "fileId": appConfig.snowflake.nextId(),
++            "filePath": pendingFile.filePath,
+             "fileName": fileName,
++            "isUri": pendingFile.isUri,
+             "size": totalSize,
+-            "port": syncer._server?.port,
+-            "fileId": syncer._fileId,
+           });
+-        },
+-        onDone: onDone,
+-      );
++        } catch (err, stack) {
++          logger.error(tag, "storage send file failed. $err $stack");
++          Global.showSnackBarWarn(text: TranslationKey.failedToLoad.tr);
++        } finally {
++          finish();
++        }
++      } else {
++        final sktService = Get.find<SocketService>();
++        final useForward = sktService.isUseForward(device.guid);
++        FileSyncHandler._private(
++          pendingFile: pendingFile,
++          context: context,
++          useForward: useForward,
++          targetDevId: useForward ? device.guid : null,
++          onReady: (syncer) async {
++            device.sendData(MsgType.file, {
++              "fileName": fileName,
++              "size": totalSize,
++              "port": syncer._server?.port,
++              "fileId": syncer._fileId,
++            });
++          },
++          onDone: finish,
++        );
++      }
++    } catch (err, stack) {
++      logger.error(tag, "prepare send file failed. $err $stack");
++      Global.showSnackBarWarn(text: TranslationKey.failedToLoad.tr);
++      finish();
+     }
+   }
+ 
+@@ -408,12 +547,21 @@
+     final appConfig = Get.find<ConfigService>();
+     Device? dev = await dbService.deviceDao.getById(devId, appConfig.userId);
+     if (dev == null) {
+-      logger.error(tag, "dev:$devId not found");
+-      return;
++      // 设备记录可能因用户 id 不同 / 尚未落库而查不到。旧实现直接 return，
++      // 发送端却已经开好临时端口，只能一直等到超时，表现成"发不出去"。
++      // 设备对象只用于展示来源，缺失时用发送端 guid 兜底，先保证文件能收到。
++      logger.warn(tag, "dev:$devId not found in db, fallback to sender info");
++      dev = Device.empty(
++        guid: devId,
++        devName: devId,
++        uid: appConfig.userId,
++        type: "unknown",
++      );
+     }
+-    var socket = await Socket.connect(ip, port);
++    // 发送端可能还没绑定好临时端口，或链路不通；给连接加超时，异常由上层记录并提示。
++    final socket = await Socket.connect(ip, port, timeout: const Duration(seconds: 30));
+     final safeFileName = FileUtil.sanitizeReceivedFileName(fileName);
+-    String filePath = "${appConfig.fileStorePath}/$safeFileName";
++    String filePath = "${appConfig.fileStorePath}${Constants.dirSeparate}$safeFileName";
+     File file = File(filePath);
+     logger.debug(tag, "receive file $filePath");
+     final dir = file.parent;
+@@ -422,16 +570,16 @@
+       await dir.create(recursive: true);
+     }
+ 
+-    ///文件存在处理策略
++    ///文件存在处理策略：保留发送端带过来的目录层级，不能把文件丢回根目录
+     while (file.existsSync()) {
+-      //如果文件存在，给文件加后缀
+       final seqName = file.buildDuplicateSeqName();
+-      filePath = "${appConfig.fileStorePath}/$seqName";
++      filePath = "${file.parent.path}${Constants.dirSeparate}$seqName";
+       file = File(filePath);
+     }
+     final syncingFileService = Get.find<SyncingFileProgressService>();
+     final syncingFile = SyncingFile(
+-      totalSize: size,
++      // Android 的 content provider 可能把未知大小报成 -1，不能让它触发断言。
++      totalSize: size < 0 ? 0 : size,
+       context: context,
+       filePath: filePath,
+       fromDev: dev,
+@@ -479,47 +627,73 @@
+       },
+       onError: (err, stack) {
+         logger.error(tag, "receive file failed. $err $stack");
+-        file.delete();
++        Global.showSnackBarWarn(text: TranslationKey.failedToLoad.tr);
++        socket.destroy();
+         syncingFile.close(false);
++        // close() 是异步的，等流落盘后再删，避免 Windows 上句柄未释放导致残留。
++        unawaited(() async {
++          await syncingFile.sinkDone;
++          try {
++            if (file.existsSync()) await file.delete();
++          } catch (_) {}
++        }());
+       },
+       cancelOnError: true,
+       onDone: () async {
+-        // 对端发送完成后会主动关闭写端，本端必须立即释放 Socket，避免连接停留在 CLOSE_WAIT。
+-        socket.destroy();
+-        var end = DateTime.now();
+-        int offset = max(end.difference(start).inSeconds, 1);
+-        int speed = size ~/ offset;
+-        logger.info(
+-          tag,
+-          "onDone $offset seconds, size: ${size.sizeStr}, speed: ${speed.sizeStr}/s",
+-        );
+-        var history = History(
+-          id: fileId,
+-          uid: userId,
+-          devId: devId,
+-          time: start.toString(),
+-          content: filePath,
+-          type: HistoryContentType.file.value,
+-          size: size,
+-          sync: true,
+-        );
+-        final historyController = Get.find<HistoryController>();
+         try {
+-          await historyController.addData(history, null, false);
+-        } finally {
++          // 对端发送完成后会主动关闭写端，本端必须立即释放 Socket，避免连接停留在 CLOSE_WAIT。
++          socket.destroy();
+           syncingFile.close(true);
+-        }
+-        await _notifyReceivedFileIfNeeded(
+-          appConfig: appConfig,
+-          file: file,
+-          fileId: fileId,
+-        );
+-        if (file.isMediaFile) {
+-          //媒体文件，刷新媒体库
+-          if (Platform.isAndroid) {
+-            var androidChannelService = Get.find<AndroidChannelService>();
+-            androidChannelService.notifyMediaScan(filePath);
++          // 等文件流真正落盘，再判断结果、写历史记录，避免记录一个 0 字节的假成功。
++          await syncingFile.sinkDone;
++          final written = file.existsSync() ? await file.length() : 0;
++          if (written <= 0) {
++            logger.error(tag, "receive file $filePath failed: no data received");
++            Global.showSnackBarWarn(text: TranslationKey.failedToLoad.tr);
++            try {
++              if (file.existsSync()) await file.delete();
++            } catch (_) {}
++            return;
++          }
++          if (size > 0 && written != size) {
++            // 发送端声明的大小可能来自 content provider 元数据，与实际字节数不一致，
++            // 只告警不丢文件，历史记录里写真实大小。
++            logger.warn(tag, "receive file $filePath size mismatch: declared=$size, actual=$written");
++          }
++          var end = DateTime.now();
++          int offset = max(end.difference(start).inSeconds, 1);
++          int speed = written ~/ offset;
++          logger.info(
++            tag,
++            "onDone $offset seconds, size: ${written.sizeStr}, speed: ${speed.sizeStr}/s",
++          );
++          var history = History(
++            id: fileId,
++            uid: userId,
++            devId: devId,
++            time: start.toString(),
++            content: filePath,
++            type: HistoryContentType.file.value,
++            size: written,
++            sync: true,
++          );
++          final historyController = Get.find<HistoryController>();
++          await historyController.addData(history, null, false);
++          await _notifyReceivedFileIfNeeded(
++            appConfig: appConfig,
++            file: file,
++            fileId: fileId,
++          );
++          if (file.isMediaFile) {
++            //媒体文件，刷新媒体库
++            if (Platform.isAndroid) {
++              var androidChannelService = Get.find<AndroidChannelService>();
++              androidChannelService.notifyMediaScan(filePath);
++            }
+           }
++        } catch (err, stack) {
++          logger.error(tag, "finalize received file failed. $err $stack");
++          Global.showSnackBarWarn(text: TranslationKey.failedToLoad.tr);
+         }
+       },
+     );
+--- a/lib/app/services/transport/storage_service.dart
++++ b/lib/app/services/transport/storage_service.dart
+@@ -1419,7 +1419,13 @@
+       final fileName = map["fileName"] as String;
+       final storageFilePath = "$datePath/files/$fileName";
+       final safeFileName = FileUtil.sanitizeReceivedFileName(fileName);
+-      final localPath = appConfig.fileStorePath + "/$safeFileName".normalizePath;
++      final localPath = "${appConfig.fileStorePath}${Constants.dirSeparate}$safeFileName".normalizePath;
++      // 发送端的 fileName 可能带目录层级（发送文件夹时），父目录不存在会让
++      // downloadFile 直接失败；直连分支的 receiveFile 已有同样处理。
++      final localDir = File(localPath).parent;
++      if (!await localDir.exists()) {
++        await localDir.create(recursive: true);
++      }
+       //add syncing file
+       final syncingFileService = Get.find<SyncingFileProgressService>();
+       Device? dev = await dbService.deviceDao.getById(
+@@ -1427,11 +1433,17 @@
+         appConfig.userId,
+       );
+       if (dev == null) {
+-        logger.error(tag, "dev:$fromDevId not found");
+-        return;
++        // 与直连接收端保持一致：设备记录查不到也要把文件收下来，不能静默丢弃。
++        logger.warn(tag, "dev:$fromDevId not found in db, fallback to sender info");
++        dev = Device.empty(
++          guid: fromDevId,
++          devName: fromDevId,
++          uid: appConfig.userId,
++          type: "unknown",
++        );
+       }
+       syncingFile = SyncingFile(
+-        totalSize: size,
++        totalSize: size < 0 ? 0 : size,
+         context: Get.context!,
+         filePath: localPath,
+         fromDev: dev,
+@@ -1671,7 +1683,8 @@
+     late String storagePath;
+     final syncingFileService = Get.find<SyncingFileProgressService>();
+     final syncingFile = SyncingFile(
+-      totalSize: size,
++      // content:// 的 SIZE 可能是 -1（provider 未知），不能让它触发断言。
++      totalSize: size < 0 ? 0 : size,
+       context: Get.context!,
+       filePath: filePath,
+       fromDev: appConfig.device,
+@@ -1721,15 +1734,27 @@
+       );
+       fileBytes = (await stream.toList()).expand((bytes) => bytes).toList();
+       // Read the stream before returning so sendData only finishes after upload work does.
+-      if (size != fileBytes.length) {
+-        //update sync file progress
++      // Android 的 content provider 声明的 SIZE 只是元数据，经常与 openInputStream
++      // 读出的字节数不一致（虚拟文件、转码 provider，甚至直接报 -1）。旧实现
++      // 一旦不等就静默 return，结果就是「Android 显示已发送、对端永远收不到」。
++      // 这里以真实读到的字节数为准，并回写进 fileInfo 供接收端使用。
++      final actualSize = fileBytes.length;
++      if (actualSize <= 0) {
+         logger.warn(
+           tag,
+-          "sync file failed. size ${fileBytes.length} != $size. path = $filePath, storagePath = $storageFilePath",
++          "sync file failed. empty stream. path = $filePath, storagePath = $storageFilePath",
+         );
+         syncingFile.setState(SyncingFileState.error);
+         return;
+       }
++      if (size != actualSize) {
++        logger.warn(
++          tag,
++          "declared size $size != actual $actualSize, use actual. path = $filePath",
++        );
++        data["size"] = actualSize;
++        history.size = actualSize;
++      }
+       syncingFile.setState(SyncingFileState.syncing);
+       final result = await client.createFile(
+         storageFilePath,
+@@ -1766,64 +1791,8 @@
+         );
+         syncingFile.setState(SyncingFileState.done);
+       }
+-      if (DateTime.now().microsecondsSinceEpoch < 0) {
+-        stream.listen(
+-          (bytes) => fileBytes.addAll(bytes),
+-          onDone: () async {
+-            //read all
+-            if (size != fileBytes.length) {
+-              //update sync file progress
+-              logger.warn(
+-                tag,
+-                "sync file failed. size ${fileBytes.length} != $size. path = $filePath, storagePath = $storageFilePath",
+-              );
+-              syncingFile.setState(SyncingFileState.error);
+-              return;
+-            }
+-            syncingFile.setState(SyncingFileState.syncing);
+-            final result = await client.createFile(
+-              storageFilePath,
+-              Uint8List.fromList(fileBytes),
+-              onProgress: onStorageProgressSync,
+-              createDir: true,
+-            );
+-            if (!result) {
+-              //update sync file progress
+-              logger.warn(
+-                tag,
+-                "sync file failed. path = $filePath, storagePath = $storageFilePath",
+-              );
+-              syncingFile.setState(SyncingFileState.error);
+-            } else {
+-              //上传文件信息
+-              final result = await client.createFile(
+-                storageFileInfoPath,
+-                utf8.encode(jsonEncode(data)),
+-                createDir: true,
+-              );
+-              if (!result) {
+-                await client.deleteFile(storageFilePath);
+-                logger.warn(
+-                  tag,
+-                  "sync file info failed. path = $storageFileInfoPath. filePath = $filePath",
+-                );
+-                return;
+-              }
+-              //本地写入记录
+-              historyController.addData(history, null, false);
+-              //ws send
+-              _wsService.send(
+-                WsMsgData(
+-                  WsMsgType.syncFile,
+-                  "$today:$_selfDevId:$id",
+-                  dev.guid,
+-                ),
+-              );
+-              syncingFile.setState(SyncingFileState.done);
+-            }
+-          },
+-        );
+-      }
++      // 旧的异步上传实现已由上面的 await 版本取代，删除恒 false 的死代码，
++      // 避免后续维护时误以为还有第二条上传路径。
+       //endregion
+     } else {
+       //region local file
+--- a/lib/app/services/transport/socket_service.dart
++++ b/lib/app/services/transport/socket_service.dart
+@@ -799,11 +799,11 @@
+             targetId: targetId,
+           );
+         } catch (err, stack) {
+-          logger.debug(
++          logger.error(
+             tag,
+-            "receive file failed from forward"
+-            "$err $stack",
++            "receive file failed from forward. $err $stack",
+           );
++          Global.showSnackBarWarn(text: TranslationKey.failedToLoad.tr);
+         }
+         break;
+       case ForwardMsgType.fileReceiverConnected:
+@@ -1005,11 +1005,13 @@
+             context: Get.context!,
+           );
+         } catch (err, stack) {
+-          logger.debug(
++          // 之前只打 debug 日志，文件没收到时界面毫无提示，看起来像"静默丢弃"。
++          logger.error(
+             tag,
+             "receive file failed. ip:$ip, port: $port, size: $size, fileName: $fileName. "
+             "$err $stack",
+           );
++          Global.showSnackBarWarn(text: TranslationKey.failedToLoad.tr);
+         }
+         break;
+       default:
+--- a/lib/app/data/models/syncing_file.dart
++++ b/lib/app/data/models/syncing_file.dart
+@@ -44,6 +44,20 @@
+ 
+   String get startTime => _fileStartTime;
+ 
++  /// 接收端文件写入流的落盘完成信号。
++  ///
++  /// 只有 close() 之后 done 才会完成；调用方在写历史记录/通知前应当等待它，
++  /// 否则可能把还没 flush 到磁盘的文件当成已接收完成。
++  Future<void> get sinkDone async {
++    final sink = _sink;
++    if (sink == null) return;
++    try {
++      await sink.done.timeout(const Duration(seconds: 30));
++    } catch (_) {
++      // 落盘超时不阻塞后续处理，由调用方按实际文件长度判断结果。
++    }
++  }
++
+   int get lessTime => speed == 0 ? -1 : (totalSize - _savedBytes) ~/ speed;
+ 
+   void addBytes(List<int> bytes) {
+--- a/lib/app/utils/global.dart
++++ b/lib/app/utils/global.dart
+@@ -34,7 +34,12 @@
+     String text,
+     Color color,
+   ) {
+-    assert(context != null || scaffoldMessengerState != null);
++    // 后台/传输线程里调用方常常只传 text，兜底取全局 context；两者都没有时
++    // 直接忽略提示，避免空指针把文件传输等主流程打断。
++    context ??= Get.context;
++    if (context == null && scaffoldMessengerState == null) {
++      return;
++    }
+     if (context != null) {
+       AnimatedSnackBar(
+         builder: ((context) {
+--- a/android/app/src/main/kotlin/top/coclyun/clipshare/MyApplication.kt
++++ b/android/app/src/main/kotlin/top/coclyun/clipshare/MyApplication.kt
+@@ -43,7 +43,6 @@
+ import java.io.File
+ import java.io.FileOutputStream
+ import java.io.OutputStream
+-import java.net.URLDecoder
+ 
+ const val lockHistoryFloatLocation = "LOCK_HISTORY_FLOAT_LOCATION"
+ const val setHistoryFloatHandleWidth = "SET_HISTORY_FLOAT_HANDLE_WIDTH"
+@@ -554,7 +553,9 @@
+                         outputStream.close()
+                     } catch (e: Exception) {
+                         e.printStackTrace();
+-                        result.success(null)
++                        // 复制失败不要把可能不完整的路径返回给 Dart 侧；
++                        // 也不能在这里再回一次包，MethodChannel 只允许 reply 一次。
++                        savedPath = null
+                     }
+                     result.success(savedPath)
+                 }
+@@ -564,7 +565,14 @@
+                         val content = args["uri"].toString()
+                         val uri = content.toUri()
+                         val documentFile = DocumentFile.fromSingleUri(this, uri)
+-                        val fileName = URLDecoder.decode(documentFile!!.name, "UTF-8")
++                        // DISPLAY_NAME 已经是解码后的显示名，再做 URLDecoder.decode 会把 '+'
++                        // 变成空格，遇到孤立的 '%' 更是直接抛异常，使文件连发送列表都进不去。
++                        // 与 copyFileFromUri 的处理保持一致。
++                        val fileName = documentFile?.name
++                        if (fileName.isNullOrEmpty() || documentFile == null) {
++                            result.success(null)
++                            return@setMethodCallHandler
++                        }
+                         val length = documentFile.length()
+                         result.success("$fileName,$length")
+                     } catch (e: Exception) {

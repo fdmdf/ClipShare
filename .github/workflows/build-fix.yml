@@ -1,0 +1,124 @@
+name: build-fix
+
+# 仅用于验证 Android -> Windows 文件发送修复的构建，不产出正式发行包。
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: "3.41.9"
+
+jobs:
+  # 先跑静态分析，几分钟内就能暴露语法/类型错误，比完整构建反馈快。
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      # 上游的 build.gradle 会无条件读取 android/key.properties，
+      # 这里生成一个一次性调试签名，免去配置仓库 secrets 才能编译。
+      - name: Prepare temporary signing config
+        run: |
+          keytool -genkeypair -v \
+            -keystore android/app/ci-debug.jks \
+            -storetype JKS \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias ci-debug \
+            -storepass clipshare -keypass clipshare \
+            -dname "CN=ClipShare CI, OU=CI, O=CI, L=CI, S=CI, C=CN"
+          cat > android/key.properties <<'EOF'
+          storePassword=clipshare
+          keyPassword=clipshare
+          keyAlias=ci-debug
+          storeFile=ci-debug.jks
+          EOF
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Build APK
+        run: flutter build apk --release --target-platform android-arm64
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipshare-android-apk
+          path: build/app/outputs/apk/release/*.apk
+          if-no-files-found: error
+          overwrite: true
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Build Windows
+        run: flutter build windows --release
+
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          $releaseDir = Get-ChildItem -Path build/windows -Recurse -Directory -Filter Release |
+            Select-Object -First 1
+          if (-not $releaseDir) {
+            Write-Error "Release directory not found under build/windows"
+            exit 1
+          }
+          Write-Host "Packaging $($releaseDir.FullName)"
+          Compress-Archive -Path "$($releaseDir.FullName)\*" -DestinationPath "ClipShare-windows-x64.zip" -Force
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipshare-windows-x64
+          path: ClipShare-windows-x64.zip
+          if-no-files-found: error
+          overwrite: true

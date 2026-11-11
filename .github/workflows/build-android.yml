@@ -1,0 +1,100 @@
+name: build-android-apk
+
+# 仓库写入权限
+permissions:
+  contents: write
+on:
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      artifact-name:
+        value: android-package
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      artifact-name: android-apk
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Enable Git long paths
+        run: git config --system core.longpaths true
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.41.9
+          cache: true
+
+      - name: Setup Java (Android)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          
+      - name: Restore keystore
+        shell: bash
+        run: |
+          echo "Secret length of ANDROID_KEY_PROPERTIES_BASE64: ${#ANDROID_KEY_PROPERTIES_BASE64}"
+          echo "Secret length of ANDROID_JKS_BASE64: ${#ANDROID_JKS_BASE64}"
+          echo "$ANDROID_KEY_PROPERTIES_BASE64" | base64 --decode > android/key.properties
+          echo "$ANDROID_JKS_BASE64" | base64 --decode > android/app/clipshare.jks
+        env:
+          ANDROID_KEY_PROPERTIES_BASE64: ${{ secrets.ANDROID_KEY_PROPERTIES_BASE64 }}
+          ANDROID_JKS_BASE64: ${{ secrets.ANDROID_JKS_BASE64 }}
+          
+      - name: Debug Android SDK location
+        shell: pwsh
+        run: |
+          Write-Host "ANDROID_SDK_ROOT=$env:ANDROID_SDK_ROOT"
+          Write-Host "ANDROID_HOME=$env:ANDROID_HOME"
+          Write-Host "Listing C:\Android"
+          Get-ChildItem C:\Android -Force
+
+      - name: Build APK
+        shell: pwsh
+        run: |
+          cd scripts
+          ./build_apk.bat
+          cd ..
+
+      - name: Prepare APK artifact
+        shell: pwsh
+        run: |
+          $apkDir = "build/app/outputs/apk/release"
+      
+          if (-not (Test-Path $apkDir)) {
+            Write-Error "APK directory not found: $apkDir"
+            exit 1
+          }
+      
+          $apks = Get-ChildItem $apkDir -Filter *.apk
+      
+          if (-not $apks -or $apks.Count -eq 0) {
+            Write-Error "No APK found in $apkDir"
+            exit 1
+          }
+      
+          Write-Host "Found $($apks.Count) APK(s):"
+          $apks | ForEach-Object {
+            Write-Host " - $($_.Name)"
+          }
+      
+          New-Item -ItemType Directory -Path upload -Force | Out-Null
+      
+          Copy-Item $apks.FullName upload/ -Force
+
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: upload/*.apk
+          overwrite: true
+

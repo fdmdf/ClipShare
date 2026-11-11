@@ -1,0 +1,280 @@
+name: clipshare
+description: "ClipShare"
+# The following line prevents the package from being accidentally published to
+# pub.dev using `flutter pub publish`. This is preferred for private packages.
+publish_to: 'none' # Remove this line if you wish to publish to pub.dev
+
+# The following defines the version and build number for your application.
+# A version number is three numbers separated by dots, like 1.2.43
+# followed by an optional build number separated by a +.
+# Both the version and the builder number may be overridden in flutter
+# build by specifying --build-name and --build-number, respectively.
+# In Android, build-name is used as versionName while build-number used as versionCode.
+# Read more about Android versioning at https://developer.android.com/studio/publish/versioning
+# In iOS, build-name is used as CFBundleShortVersionString while build-number is used as CFBundleVersion.
+# Read more about iOS versioning at
+# https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
+# In Windows, build-name is used as the major, minor, and patch parts
+# of the product and file versions while build-number is used as the build suffix.
+version: 1.5.4+31
+
+environment:
+  # At least Flutter 3.32.1
+  sdk: '>=3.8.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  get: ^4.6.6
+  # 数据库框架
+  floor: ^1.4.2
+  sqflite: any
+  # sqlite3 macos 0.5.40 以上需要更高的macos版本，暂时固定在 0.5.40
+  sqlite3_flutter_libs: 0.5.40
+  # 托盘插件 linux上需要安裝：sudo apt-get install libayatana-appindicator3-dev
+#  tray_manager: ^0.5.2
+  tray_manager:
+    git:
+      url: https://github.com/aa2013/tray_manager
+      ref: custom-id
+      path: packages/tray_manager
+  # 窗体管理
+  window_manager: ^0.5.0
+  # 开机启动
+  launch_at_startup: ^0.5.1
+  # 加密
+  crypto: ^3.0.3
+  encrypt: ^5.0.3
+  # 工具类
+  basic_utils: ^5.7.0
+  uuid: ^4.5.3
+  # 验证码控件
+  pinput: ^3.0.1
+  # 日志
+  logger: ^2.0.2+1
+  # 检测网络变化
+  connectivity_plus: ^5.0.2
+  # 本机信息
+  device_info_plus: ^11.5.0
+  # 包信息
+  package_info_plus: ^8.0.2
+  # 链接可点击
+  flutter_linkify: ^6.0.0
+  # 右键菜单
+  flutter_context_menu: ^0.2.0
+  # snackbar
+  animated_snack_bar: ^0.4.0
+  # 打开链接
+  url_launcher: ^6.2.5
+  # 多窗口
+  desktop_multi_window: ^0.2.1
+  # Desktop click-outside watcher
+  desktop_click_outside: ^0.0.1
+  # 解析 windows 快捷方式实际地址
+  resolve_windows_shortcut: ^2.0.0
+  # 快捷键
+  hotkey_manager: ^0.2.2
+  # Windows 注册表
+  win32_registry: ^2.1.0
+  # Windows 原生 API（弹窗 WS_EX_NOACTIVATE）
+  win32: ^5.15.0
+  ffi: ^2.2.0
+  # 允许 Flutter 桌面应用检索关于屏幕大小，显示，光标位置等信息。
+  screen_retriever: ^0.2.0
+  # 提供一种平台无关的方式以一致的方式访问设备的文件位置系统
+  path_provider: ^2.1.2
+  # 文件打开（解决 Android13 权限问题）
+  open_file_plus:
+    git: # 解决 flutter 3.29 PluginRegistry.Registrar 不支持的问题
+      url: https://github.com/postflow/open_file_plus
+  # markdown 渲染
+  flutter_markdown: ^0.6.22+1
+  # 文件选择
+  file_picker:
+    git:
+      url: https://github.com/aa2013/flutter_file_picker
+      ref: modify-android-saf-intent
+  # 权限请求
+  # 14.0.0 要求尚未接入项目的 AGP 9/Kotlin 2.3.20，当前 Android 工具链使用 13.0.1。
+  permission_handler_android: ^13.0.1
+  permission_handler_apple: ^9.6.1
+  permission_handler_platform_interface: ^4.4.0
+  # 瀑布流布局
+  flutter_staggered_grid_view: ^0.7.0
+  # material 图标库
+  flutter_material_design_icons: ^3.0.0+7447
+  # 品牌图标库，material图标库将在 v8 版本移除所有品牌图标
+  simple_icons: ^14.6.1
+  # 本地身份认证
+  local_auth: ^2.2.0
+  # 接受其他应用的分享操作
+  share_handler: ^0.0.21
+  share_plus: ^10.0.2
+  # 图表库
+  graphic: ^2.5.0
+  # 日期选择
+  calendar_date_picker2: ^1.1.6
+  # 月份选择
+  month_picker_dialog: ^5.1.2
+  # 剪贴板监听
+  clipshare_clipboard_listener: ^1.3.6
+  # 主题切换动画
+  animated_theme_switcher: ^2.0.8
+  # 大文本编辑器
+  re_editor: ^0.8.0
+  # http请求
+  http: ^1.2.2
+  stream_channel: ^2.1.4
+  web_socket_channel: ^3.0.3
+  # 倒计时的 snackbar ，支持在指定的scaffold上显示
+  timer_snackbar:
+    git:
+      url: https://github.com/aa2013/timer_snackbar.git
+      ref: master
+  # 类 json 的二进制序列化
+  msgpack_dart: ^1.0.1
+  # 唤醒
+  wakelock_plus: ^1.2.10
+  # 二维码生成
+  qr_flutter: ^4.1.0
+  # 二维码扫描
+  qr_code_scanner_plus: 2.0.10+1
+  # 截屏检测（Android/IOS）
+  flutter_screenshot_detect:
+    git:
+      url: https://github.com/aa2013/screenshot_detector
+      ref: main
+  # easy_cron
+  easy_cron: ^0.9.2
+  # excel导出
+  syncfusion_flutter_xlsio: ^29.2.11
+  # http request
+  dio: ^5.8.0+1
+  # 系统通知
+  flutter_local_notifications: ^19.2.1
+  # 禁止截屏, pub.dev 上的版本在 macos 上会提示缺少 podfile，但是GitHub上的主分支是正常的，所以暂时 fork 一份
+  no_screenshot:
+    git: https://github.com/aa2013/no_screenshot.git
+  # Android uri读取
+  uri_file_reader: ^1.0.3
+#    path: ../uri_file_reader
+  # 分词 (去除了分词文件减小压缩包体积，改为下载或导入)
+  jieba_flutter:
+    git:
+      url: https://github.com/aa2013/jieba_flutter.git
+      ref: 87be14a040e2138740b85f7afeac800f9ca822fe
+  # 粘性折叠分组，该版本至少 SDK 3.8.0
+  sliver_sticky_collapsable_panel: ^3.0.0
+  # 获取已安装的app（仅 Android）
+  get_apps:
+    git:
+      url: https://github.com/aa2013/get_apps.git
+  # 通知信息监听（仅 Android）
+  notification_listener_service:
+    git:
+      url: https://github.com/aa2013/notification_listener_service
+  # zip
+  zip_flutter:
+    git:
+      url: https://github.com/aa2013/zip_flutter
+  webdav_plus:
+    git:
+      url: https://github.com/aa2013/webdav_plus.git
+      ref: custom-user-agent
+  dart_aliyun_oss: ^1.4.0
+  minio:
+    git:
+      url: https://github.com/aa2013/minio-dart
+      ref: custom-user-agent
+  # Android/IOS deviceId generator
+  persistent_device_id: ^1.1.0
+  # 滑动操作
+  flutter_slidable: ^4.0.3
+  # 扩展的浮动按钮
+  flutter_expandable_fab: ^2.5.2
+  # 保存图片至相册
+  flutter_image_gallery_saver: ^1.1.3
+  # lua ffi
+  flutter_embed_lua:
+    git:
+      url: https://github.com/aa2013/flutter_embed_lua
+  # 可拖拉的切分视图
+  multi_split_view: ^3.6.1
+  # Color picker
+  flutter_colorpicker: ^1.1.0
+  # 原生拖拽
+  super_drag_and_drop:
+    git:
+      url: https://github.com/aa2013/super_native_extensions
+      ref: super_drag_and_drop_0_9_1
+      path: super_drag_and_drop
+  # 文件拖拽
+  desktop_drop: ^0.5.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  floor_generator: ^1.4.2
+  build_runner: ^2.1.2
+  flutter_launcher_icons: ^0.13.1
+
+  flutter_lints: ^3.0.2
+flutter_launcher_icons:
+  ios: true
+  android: "launcher_icon"
+  image_path: "assets/images/logo/logo.png"
+  min_sdk_android: 24 # android min sdk min:16, default 21
+  windows:
+    generate: true
+    image_path: "assets/images/logo/logo.png"
+    icon_size: 48 # min:48, max:256, default: 48
+  macos:
+    generate: true
+    image_path: "assets/images/logo/logo.png"
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/
+    - assets/lua/
+    - assets/images/logo/logo.png
+    - assets/images/logo/logo_white.png
+    - path: assets/images/logo/logo-warn.ico
+      platforms:
+        - windows
+    - path: assets/images/logo/logo-warn.png
+      platforms:
+        - windows
+        - linux
+        - macos
+    - path: assets/images/logo/logo.ico
+      platforms:
+        - windows
+    - path: assets/images/logo/root.png
+      platforms:
+        - android
+    - path: assets/images/logo/shizuku.png
+      platforms:
+        - android
+    - path: assets/md/updateLogs-Android.md
+      platforms:
+        - android
+    - path: assets/md/updateLogs-Linux.md
+      platforms:
+        - linux
+    - path: assets/md/updateLogs-MacOS.md
+      platforms:
+        - macos
+    - path: assets/md/updateLogs-Windows.md
+      platforms:
+        - windows
+    - path: assets/md/updateLogs-IOS.md
+      platforms:
+        - ios
+    - path: assets/scripts/update_windows.bat
+      platforms:
+        - windows
+    - path: assets/videos/pip_example.mp4
+      platforms:
+        - ios

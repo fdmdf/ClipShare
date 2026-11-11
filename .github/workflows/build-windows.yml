@@ -1,0 +1,91 @@
+name: build-windows
+
+# 仓库写入权限
+permissions:
+  contents: write
+  
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag for test build'
+        required: true
+        default: 'test'
+        type: string
+  workflow_call:
+    outputs:
+      artifact-name:
+        value: windows-package
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Enable Git long paths
+      run: git config --system core.longpaths true
+
+    - name: Install InnoSetup
+      uses: crazy-max/ghaction-chocolatey@v2
+      with:
+        args: install innosetup -y --no-progress
+        
+    - name: Setup Flutter
+      uses: subosito/flutter-action@v2
+      with:
+        channel: 'stable'
+        flutter-version: 3.41.9
+        cache: true
+      
+    - name: Build with fastforge
+      run: |
+        copy "./windows/packaging/exe/ChineseSimplified.isl" "C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl"
+        dart pub global activate fastforge
+        # 使用 fastforge 构建
+        cd scripts
+        ./build_windows_exe.bat
+        cd ../
+        # 1. 找到 dist/**/*.exe 中的第一个 exe
+        $exe = Get-ChildItem -Path dist -Recurse -Filter *.exe | Select-Object -First 1
+    
+        if (-not $exe) {
+          Write-Error "No exe found under dist/**"
+          exit 1
+        }
+    
+        # 2. zip 文件名 = exe 文件名.zip
+        $zipName = "$($exe.BaseName).zip"
+    
+        # 3. Release 目录路径
+        $releasePath = "build/windows/x64/runner/Release"
+    
+        if (-not (Test-Path $releasePath)) {
+          Write-Error "Release path not found: $releasePath"
+          exit 1
+        }
+    
+        # 4. 压缩 Release 目录下的所有内容（不包含 Release 本身）
+        Compress-Archive `
+          -Path "$releasePath\*" `
+          -DestinationPath $zipName `
+          -Force
+
+        Write-Host "Zip created: $zipName"
+        # 创建目录
+        New-Item -ItemType Directory -Path output -Force | Out-Null
+        # 复制 exe 和 zip 到 output
+        Copy-Item $exe.FullName output/
+        Copy-Item $zipName output/
+    
+        Write-Host "Output files:"
+        Get-ChildItem output
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-build
+        path: output/*
+        overwrite: true

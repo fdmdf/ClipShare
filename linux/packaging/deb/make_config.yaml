@@ -1,0 +1,39 @@
+display_name: ClipShare
+package_name: ClipShare
+generic_name: Cross-Platform Clipboard Sync
+categories:
+  - Utility
+maintainer:
+  name: aa2013
+  email: coclyun@gmail.com
+#co_authors:
+#  - name: Kingkor Roy Tirtho
+#    email: krtirtho@gmail.com
+priority: optional
+section: x11
+installed_size: 66560
+essential: false
+icon: assets/images/logo/logo.png
+
+dependencies:
+  - libgtk-3-0
+  - libayatana-appindicator3-1
+  - libkeybinder-3.0-0
+  - libx11-6
+  - libxext6
+  - libxtst6
+  - libwayland-client0
+  - libsqlite3-0
+
+keywords:
+  - Clipboard
+  - Clipboard Manager
+  - Copy Paste
+  - History
+  - Productivity
+  - Utility
+  - Snippet
+  - Manager
+  - Enhanced Clipboard
+  - Paste History
+startup_notify: true

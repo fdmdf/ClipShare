@@ -1,0 +1,81 @@
+name: build-macos-dmg
+
+# 仓库写入权限
+permissions:
+  contents: write
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag for test build'
+        required: true
+        default: 'test'
+        type: string
+  workflow_call:
+    outputs:
+      artifact-name:
+        value: macos-package
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Verify Xcode
+        run: |
+          xcode-select -p
+          xcodebuild -version
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.41.9
+          cache: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies for Fastforge
+        run: |
+          npm install -g appdmg
+          dart pub global activate fastforge
+          echo "$HOME/.pub-cache/bin" >> $GITHUB_PATH
+          fastforge --version
+        shell: bash
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build & Package DMG
+        run: |
+          cd scripts
+          chmod +x build_macos.sh
+          ./build_macos.sh
+        shell: bash
+        
+      - name: Find and Upload DMG artifact
+        run: |
+          DMG_FILE=$(find dist -name "*.dmg" -type f | head -1)
+          if [ -n "$DMG_FILE" ]; then
+            echo "Found DMG file: $DMG_FILE"
+            # 复制到固定位置便于上传
+            mkdir -p upload
+            cp "$DMG_FILE" upload/
+          else
+            echo "No DMG file found"
+            exit 1
+          fi
+        shell: bash
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: upload/*.dmg
+          overwrite: true
